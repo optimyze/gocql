@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -182,6 +184,106 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	}
 
 	return s, nil
+}
+
+func shardForToken(token int64Token, shardCount int) int {
+	shards := uint64(shardCount)
+	z := uint64(token+math.MinInt64) << 12
+	lo := z & 0xffffffff
+	hi := (z >> 32) & 0xffffffff
+	mul1 := lo * shards
+	mul2 := hi * shards
+	sum := (mul1 >> 32) + mul2
+	return int(sum >> 32)
+}
+
+var hasher murmur3Partitioner
+
+type BatchingKey struct {
+	Shard int
+	ReplicaInfo
+}
+
+type ReplicaInfo struct {
+	Primary string
+	Secondaries string
+}
+
+type Batcher struct {
+	canBatch bool
+	s *Session
+	replicasCache map[*hostTokens]ReplicaInfo
+	hostIDCache map[*HostInfo]string
+	tokenReplicas tokenRingReplicas
+	shardCount int
+}
+
+func (s *Session) NewBatcher(shardCount int) Batcher {
+	pol, ok := s.policy.(*tokenAwareHostPolicy)
+	if !ok {
+		return Batcher{}
+	}
+	clustMeta := pol.getMetadataReadOnly()
+	keyspace := s.pool.keyspace
+	if keyspace == "" {
+		return Batcher{}
+	}
+	ringReplicas, ok := clustMeta.replicas[keyspace]
+	if !ok {
+		return Batcher{}
+	}
+
+	return Batcher{
+		canBatch: true,
+		s: s,
+		replicasCache: make(map[*hostTokens]ReplicaInfo),
+		hostIDCache: make(map[*HostInfo]string),
+		tokenReplicas: ringReplicas,
+		shardCount: shardCount,
+	}
+}
+
+func (b *Batcher) getHostID(h *HostInfo) string {
+	if hostID, found := b.hostIDCache[h]; found {
+		return hostID
+	}
+	hostID := h.HostID()
+	b.hostIDCache[h] = hostID
+	return hostID
+}
+func (b *Batcher) GetBatchingKey(partitionKey []byte) (BatchingKey, bool) {
+	if !b.canBatch {
+		return BatchingKey{}, false
+	}
+	h := hasher.Hash(partitionKey)
+	token, ok := h.(int64Token)
+	if !ok {
+		return BatchingKey{}, false
+	}
+	var res BatchingKey
+	res.Shard = shardForToken(token, b.shardCount)
+
+	replicas := b.tokenReplicas.replicasFor(token)
+	if replicas == nil || len(replicas.hosts) == 0{
+		return BatchingKey{}, false
+	}
+
+	if replicaInfo, found := b.replicasCache[replicas]; found {
+		res.ReplicaInfo = replicaInfo
+		return res, true
+	}
+
+	res.Primary = b.getHostID(replicas.hosts[0])
+	secondaries := make(sort.StringSlice, 0, len(replicas.hosts)-1)
+	for i := 1; i < len(replicas.hosts); i++ {
+		secondaries = append(secondaries, b.getHostID(replicas.hosts[i]))
+	}
+	secondaries.Sort()
+
+	res.Secondaries = strings.Join(secondaries, ",")
+	b.replicasCache[replicas] = res.ReplicaInfo
+
+	return res, true
 }
 
 func (s *Session) init() error {
