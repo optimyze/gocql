@@ -215,6 +215,7 @@ type Batcher struct {
 	replicasCache map[*hostTokens]ReplicaInfo
 	hostIDCache map[*HostInfo]string
 	tokenReplicas tokenRingReplicas
+	clusterMd *clusterMeta
 	shardCount int
 }
 
@@ -239,6 +240,7 @@ func (s *Session) NewBatcher(shardCount int) Batcher {
 		replicasCache: make(map[*hostTokens]ReplicaInfo),
 		hostIDCache: make(map[*HostInfo]string),
 		tokenReplicas: ringReplicas,
+		clusterMd: clustMeta,
 		shardCount: shardCount,
 	}
 }
@@ -253,18 +255,31 @@ func (b *Batcher) getHostID(h *HostInfo) string {
 }
 func (b *Batcher) GetBatchingKey(partitionKey []byte) (BatchingKey, bool) {
 	if !b.canBatch {
+		fmt.Printf("Cannot batch!\n")
 		return BatchingKey{}, false
 	}
 	h := hasher.Hash(partitionKey)
 	token, ok := h.(int64Token)
 	if !ok {
+		fmt.Printf("Bad token!\n")
 		return BatchingKey{}, false
 	}
 	var res BatchingKey
 	res.Shard = shardForToken(token, b.shardCount)
 
 	replicas := b.tokenReplicas.replicasFor(token)
+	if replicas == nil && b.clusterMd.tokenRing != nil {
+		host, _ := b.clusterMd.tokenRing.GetHostForToken(token)
+		if host == nil {
+			fmt.Printf("Nil host for token!\n")
+			return BatchingKey{}, false
+		}
+		res.Primary = b.getHostID(host)
+		return res, true
+	}
+
 	if replicas == nil || len(replicas.hosts) == 0{
+		fmt.Printf("No replicas!\n")
 		return BatchingKey{}, false
 	}
 
